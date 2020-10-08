@@ -295,7 +295,7 @@
   ],
   "devDependencies": {
     "@sourcegraph/eslint-config": "^0.16.2",
-    "@sourcegraph/extension-api-stubs": "^1.1.0",
+    "@sourcegraph/extension-api-stubs": "^1.2.2",
     "@types/mocha": "^5.2.7",
     "@types/mock-require": "^2.0.0",
     "@types/node": "^10.17.21",
