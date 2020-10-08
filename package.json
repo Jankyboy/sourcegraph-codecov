@@ -298,7 +298,7 @@
     "@sourcegraph/extension-api-stubs": "^1.1.0",
     "@types/mocha": "^5.2.7",
     "@types/mock-require": "^2.0.0",
-    "@types/node": "^10.17.21",
+    "@types/node": "^10.17.35",
     "eslint": "^6.8.0",
     "lnfs-cli": "^2.1.0",
     "mkdirp": "^0.5.5",
