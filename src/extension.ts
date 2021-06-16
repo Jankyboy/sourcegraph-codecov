@@ -1,14 +1,18 @@
 import { combineLatest, from, Subscription } from 'rxjs'
-import { concatMap, filter, map, startWith, switchMap, distinctUntilChanged } from 'rxjs/operators'
+import { concatMap, filter, map, startWith, switchMap, distinctUntilChanged, debounceTime } from 'rxjs/operators'
 import * as sourcegraph from 'sourcegraph'
-import { Service } from './api'
+import { getCommitCoverage, getTreeCoverage, Service } from './api'
 import { codecovToDecorations } from './decoration'
 import { createGraphViewProvider } from './insights'
 import { getCommitCoverageRatio, getFileCoverageRatios, getFileLineCoverage } from './model'
 import { configurationChanges, Endpoint, resolveEndpoint, resolveSettings, Settings, InsightSettings } from './settings'
-import { codecovParamsForRepositoryCommit, resolveDocumentURI, resolveRootURI } from './uri'
+import { codecovParamsForRepositoryCommit, resolveDocumentURI, ResolvedRootURI, resolveRootURI } from './uri'
 
 const decorationType = sourcegraph.app.createDecorationType && sourcegraph.app.createDecorationType()
+
+// Check if the Sourcegraph instance supports status bar items (minimum Sourcegraph version 3.26)
+const supportsStatusBarAPI = !!sourcegraph.app.createStatusBarItemType as boolean
+const statusBarItemType = sourcegraph.app.createStatusBarItemType && sourcegraph.app.createStatusBarItemType()
 
 /** Entrypoint for the Codecov Sourcegraph extension. */
 export function activate(
@@ -124,7 +128,72 @@ export function activate(
         } catch (err) {
             console.error('Error loading Codecov file coverage:', err)
         }
+
         sourcegraph.internal.updateContext(context)
+    }
+
+    async function setStatusBars(
+        endpoints: readonly Endpoint[] | undefined,
+        editors: sourcegraph.ViewComponent[]
+    ): Promise<void> {
+        if (supportsStatusBarAPI) {
+            /**
+             * Keys: repo + revision separated, repo: "sourcegraph/sourcegraph" + revision: "1234" => "sourcegraph/sourcegraph1234"
+             * Values: resolved root uri
+             * Used to find all unique pairs of repo + revision across editors
+             */
+            const resolvedRootURIs = new Map<string, ResolvedRootURI>()
+            for (const editor of editors) {
+                if (editor.type === 'CodeEditor') {
+                    const { repo, rev } = resolveRootURI(editor.document.uri)
+                    resolvedRootURIs.set(repo + rev, { repo, rev })
+                }
+            }
+
+            // Fetch data
+            const endpoint = resolveEndpoint(endpoints)
+
+            const fileRatioByURI = new Map<string, { fileRatio: string; fileURL: string }>()
+
+            const results = await Promise.allSettled(
+                [...resolvedRootURIs].map(async ([, resolvedRootURI]) => ({
+                    resolvedRootURI,
+                    fileRatios: await getFileCoverageRatios(resolvedRootURI, endpoint, sourcegraph),
+                }))
+            )
+
+            for (const result of results) {
+                if (result.status === 'fulfilled') {
+                    const { resolvedRootURI, fileRatios } = result.value
+
+                    const p = codecovParamsForRepositoryCommit(resolvedRootURI, sourcegraph)
+                    const repoURL = `${p.baseURL || 'https://codecov.io'}/${p.service}/${p.owner}/${p.repo}`
+
+                    if (fileRatios) {
+                        for (const [path, ratio] of Object.entries(fileRatios)) {
+                            // Convert relative paths to URIs
+                            const uri = `git://${resolvedRootURI.repo}?${resolvedRootURI.rev}#${path}`
+                            const baseFileURL = `${repoURL}/src/${p.sha}`
+
+                            fileRatioByURI.set(uri, { fileRatio: ratio.toFixed(0), fileURL: `${baseFileURL}/${path}` })
+                        }
+                    }
+                }
+            }
+
+            // Set status bars
+            for (const editor of editors) {
+                if (editor.type === 'CodeEditor') {
+                    const ratio = fileRatioByURI.get(editor.document.uri)
+                    if (ratio) {
+                        editor.setStatusBarItem(statusBarItemType, {
+                            text: `Code Coverage: ${ratio.fileRatio}%`,
+                            command: { id: 'open', args: [ratio.fileURL] },
+                        })
+                    }
+                }
+            }
+        }
     }
 
     // Update the context when the configuration, workspace roots or active editors change.
@@ -141,8 +210,18 @@ export function activate(
             editorsChanges,
         ])
             .pipe(
+                // Debounce to avoid doing duplicate work for intermediate states
+                // for views with multiple editors added sequentially (e.g. commit page, PR)
+                debounceTime(30),
                 concatMap(async ([endpoints, roots, editors]) => {
                     try {
+                        await setStatusBars(endpoints, editors)
+                    } catch (err) {
+                        console.error('Codecov: error setting status bars', err)
+                    }
+
+                    try {
+                        // The commit data used for `updateContext` should be cached if Status Bar API is supported
                         await updateContext(endpoints, roots, editors)
                     } catch (err) {
                         console.error('Codecov: error updating context', err)
@@ -220,5 +299,92 @@ export function activate(
                     })
             )
         }
+    }
+
+    // Experimental: file decorations. Check if the Sourcegraph instance supports
+    // file decoration providers (minimum Sourcegraph version 3.23)
+    if (sourcegraph.app.registerFileDecorationProvider) {
+        function createFileDecoration(uri: string, ratio: number, settings: Settings): sourcegraph.FileDecoration {
+            const after = {
+                contentText: `${ratio}%`,
+                hoverMessage: `Codecov: ${ratio}% covered`,
+            }
+
+            return {
+                uri,
+                after,
+                meter: {
+                    value: ratio,
+                    hoverMessage: `Codecov: ${ratio}% covered`,
+                    min: 0,
+                    max: 100,
+                    low: settings['codecov.fileDecorations.low'],
+                    high: settings['codecov.fileDecorations.high'],
+                    optimum: settings['codecov.fileDecorations.optimum'],
+                },
+            }
+        }
+
+        context.subscriptions.add(
+            sourcegraph.app.registerFileDecorationProvider({
+                provideFileDecorations: async ({ files, uri }) => {
+                    const settings = resolveSettings(sourcegraph.configuration.get<Partial<Settings>>().value)
+                    if (!settings['codecov.fileDecorations.show']) {
+                        return []
+                    }
+
+                    const { repo, rev } = resolveDocumentURI(uri)
+                    const apiParams = codecovParamsForRepositoryCommit({ repo, rev }, sourcegraph)
+
+                    // Fetch commit coverage to get ratio for files, tree coverage to get ratio for directories
+                    const nonDirectoryFiles = files.filter(file => !file.isDirectory)
+                    const directories = files.filter(file => file.isDirectory)
+                    const [commitCoverage, ...treeCoverages] = await Promise.allSettled([
+                        getCommitCoverage(apiParams),
+                        ...directories.map(async (dir, i) => {
+                            const treeCoverage = await getTreeCoverage({ ...apiParams, path: dir.path })
+                            return { treeCoverage, directory: directories[i] }
+                        }),
+                    ])
+
+                    // Iterate over files and get value from commit coverage to construct file decorations
+                    const fileDecorations: sourcegraph.FileDecoration[] = []
+
+                    if (commitCoverage.status === 'fulfilled' && commitCoverage.value) {
+                        const { files: reportFiles } = commitCoverage.value.commit.report
+                        for (const file of nonDirectoryFiles) {
+                            const report = reportFiles[file.path]
+                            if (!report) {
+                                continue
+                            }
+
+                            const ratio = parseInt(report.t.c, 10)
+
+                            fileDecorations.push(createFileDecoration(file.uri, ratio, settings))
+                        }
+                    }
+
+                    // Iterate over tree coverage results to construct directory decorations
+                    const directoryDecorations: sourcegraph.FileDecoration[] = []
+
+                    for (const result of treeCoverages) {
+                        if (result.status === 'rejected') {
+                            continue
+                        }
+
+                        const { treeCoverage, directory } = result.value
+
+                        if (!treeCoverage) {
+                            continue
+                        }
+
+                        const ratio = parseInt(treeCoverage.commit.folder_totals.coverage, 10)
+
+                        directoryDecorations.push(createFileDecoration(directory.uri, ratio, settings))
+                    }
+                    return [...fileDecorations, ...directoryDecorations]
+                },
+            })
+        )
     }
 }
